@@ -1,0 +1,235 @@
+name: Build LoRa E4 fix
+
+on:
+  push:
+    branches: [codex/lora-diagnostics-download]
+    paths: [.github/workflows/build-e4.yml]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: lora-e4-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/lora-diagnostics-download
+
+      - name: Install compilers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc gcc-arm-none-eabi binutils-arm-none-eabi \
+            libnewlib-arm-none-eabi libnewlib-dev
+
+      - name: Fix E4 and test LNA readback
+        shell: python
+        run: |
+          from pathlib import Path
+          import subprocess
+
+          helper = """
+          static uint8_t enableLnaBoost(void)
+          {
+              uint8_t before, requested, actual;
+              if (!readReg(REG_LNA, &before)) return 0U;
+              requested = (uint8_t)(before | 0x03U);
+              if (!writeReg(REG_LNA, requested) ||
+                  !readReg(REG_LNA, &actual)) return 0U;
+              if ((actual & 0x03U) == 0x03U) return 1U;
+              loraDiagnostics.lastError = LORA_ERROR_READBACK;
+              loraDiagnostics.failedRegister = REG_LNA;
+              loraDiagnostics.expectedValue = requested;
+              loraDiagnostics.actualValue = actual;
+              return 0U;
+          }
+
+          """
+          old = "!writeChecked(REG_LNA, 0x23U) ||"
+          new = "!enableLnaBoost() ||"
+          marker = "uint8_t LoRa_Init(void)"
+          definition = "static uint8_t enableLnaBoost(void)"
+
+          for role in ("Master", "relay32"):
+              path = Path("firmware-overrides") / role / "Core/Src/lora.c"
+              text = path.read_text()
+              if text.count(old) == 1 and definition not in text:
+                  if text.count(marker) != 1:
+                      raise RuntimeError("Unexpected LoRa_Init definition")
+                  text = text.replace(old, new, 1)
+                  text = text.replace(marker, helper + marker, 1)
+                  path.write_text(text.rstrip() + "\n")
+              elif old not in text and definition in text and new in text:
+                  pass
+              else:
+                  raise RuntimeError(f"Unexpected driver layout: {path}")
+
+          text = Path("firmware-overrides/Master/Core/Src/lora.c").read_text()
+          start = text.index(definition)
+          body = text[start:text.index(marker, start)]
+
+          harness = r"""
+          #include <stdint.h>
+          #include <assert.h>
+          #include <string.h>
+          #define REG_LNA 0x0CU
+          #define LORA_ERROR_READBACK 4U
+          static struct {
+              uint8_t lastError, failedRegister, expectedValue, actualValue;
+          } loraDiagnostics;
+          static uint8_t before, after, written;
+          static unsigned writes;
+          static uint8_t readReg(uint8_t reg, uint8_t *value) {
+              assert(reg == REG_LNA);
+              *value = writes ? after : before;
+              return 1U;
+          }
+          static uint8_t writeReg(uint8_t reg, uint8_t value) {
+              assert(reg == REG_LNA);
+              written = value;
+              ++writes;
+              return 1U;
+          }
+          """
+
+          cases = r"""
+          int main(void) {
+              before = 0x20; after = 0x03; writes = 0;
+              assert(enableLnaBoost() == 1 && written == 0x23);
+
+              before = 0x00; after = 0x23; writes = 0;
+              assert(enableLnaBoost() == 1 && written == 0x03);
+
+              memset(&loraDiagnostics, 0, sizeof(loraDiagnostics));
+              before = 0x20; after = 0x02; writes = 0;
+              assert(enableLnaBoost() == 0);
+              assert(loraDiagnostics.lastError == LORA_ERROR_READBACK);
+              assert(loraDiagnostics.failedRegister == REG_LNA);
+              assert(loraDiagnostics.expectedValue == 0x23);
+              assert(loraDiagnostics.actualValue == 0x02);
+              return 0;
+          }
+          """
+
+          Path("/tmp/check_lna.c").write_text(harness + body + cases)
+          subprocess.run([
+              "gcc", "-std=c11", "-Wall", "-Wextra", "-Werror",
+              "/tmp/check_lna.c", "-o", "/tmp/check_lna"
+          ], check=True)
+          subprocess.run(["/tmp/check_lna"], check=True)
+          print("LNA regression checks: 3 passed")
+
+      - name: Run existing tests
+        run: |
+          python3 tests/run_radio_tests.py
+          python3 tests/run_slave_queue_tests.py
+          python3 -m unittest discover -s tests -p 'test_cubeide_bundle.py' -v
+
+      - name: Build Debug and Release
+        run: |
+          rm -f downloads/LoRa-STM32CubeIDE.zip
+          python3 tools/build_cubeide_bundle.py
+
+      - name: Prepare complete downloads
+        shell: python
+        run: |
+          from pathlib import Path
+          import hashlib, json, shutil, zipfile
+
+          folder = Path("downloads")
+          source = folder / "LoRa-STM32CubeIDE.zip"
+          prefix = "LoRa-STM32CubeIDE"
+          names = ["LoRa_Master", "LoRa_Node1", "LoRa_Node2", "LoRa_Node3"]
+
+          note = (
+              "E4 FIX: LNA uses read-modify-write and verifies boost bits 1:0.\n"
+              "Other register checks remain strict.\n"
+              "Software tests and Debug/Release builds were run by GitHub Actions.\n"
+              "CubeIDE GUI and physical RF communication were not tested.\n"
+              "This fix does not resolve Node 1 E3 V00.\n"
+              "Complete projects: LoRa-STM32CubeIDE/Projects.\n"
+              "Ready HEX/BIN: LoRa-STM32CubeIDE/Prebuilt.\n"
+          )
+
+          with zipfile.ZipFile(source) as archive:
+              if archive.testzip() is not None:
+                  raise RuntimeError("Corrupt generated ZIP")
+
+              report = json.loads(
+                  archive.read(prefix + "/VALIDATION.json")
+              )
+              if len(report["builds"]) != 8 or any(
+                  item["status"] != "passed"
+                  for item in report["builds"]
+              ):
+                  raise RuntimeError("Eight successful builds required")
+
+              for name in names:
+                  driver = archive.read(
+                      f"{prefix}/Projects/{name}/Core/Src/lora.c"
+                  ).decode()
+                  if "!enableLnaBoost() ||" not in driver:
+                      raise RuntimeError("Missing E4 fix: " + name)
+                  if "!writeChecked(REG_LNA, 0x23U) ||" in driver:
+                      raise RuntimeError("Old LNA check remains")
+
+          with zipfile.ZipFile(
+              source, "a", zipfile.ZIP_DEFLATED
+          ) as archive:
+              archive.writestr(prefix + "/FIX_E4.txt", note)
+
+          shutil.copyfile(
+              source, folder / "LoRa-STM32CubeIDE-E4-FIX.zip"
+          )
+          shutil.copyfile(
+              source, folder / "LoRa-diagnostics.zip"
+          )
+
+          targets = ["Master", "relay32-node1", "relay32-node2", "relay32-node3"]
+
+          with zipfile.ZipFile(source) as full, zipfile.ZipFile(
+              folder / "LoRa-firmware-only.zip",
+              "w", zipfile.ZIP_DEFLATED
+          ) as small:
+              small.writestr("FIX_E4.txt", note)
+              for project, target in zip(names, targets):
+                  for extension in ("hex", "bin"):
+                      data = full.read(
+                          f"{prefix}/Prebuilt/{project}/{project}.{extension}"
+                      )
+                      small.writestr(
+                          f"{target}/firmware.{extension}", data
+                      )
+
+          (folder / "FIX_E4.txt").write_text(note)
+          (folder / "SHA256SUMS").write_text("".join(
+              hashlib.sha256(path.read_bytes()).hexdigest()
+              + "  " + path.name + "\n"
+              for path in sorted(folder.glob("*.zip"))
+          ))
+
+          for path in folder.glob("*.zip"):
+              with zipfile.ZipFile(path) as archive:
+                  if archive.testzip() is not None:
+                      raise RuntimeError("Corrupt download: " + str(path))
+
+      - name: Push files to GitHub
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add firmware-overrides/Master/Core/Src/lora.c
+          git add firmware-overrides/relay32/Core/Src/lora.c
+          git add downloads/*.zip downloads/SHA256SUMS downloads/FIX_E4.txt
+          git diff --cached --check
+          if ! git diff --cached --quiet; then
+            git commit -m "Fix E4 and rebuild complete LoRa firmware"
+            git push origin HEAD:refs/heads/codex/lora-diagnostics-download
+          fi
