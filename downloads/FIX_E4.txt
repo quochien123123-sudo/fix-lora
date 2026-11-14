@@ -1,0 +1,7 @@
+E4 FIX: LNA uses read-modify-write and verifies boost bits 1:0.
+Other register checks remain strict.
+Software tests and Debug/Release builds were run by GitHub Actions.
+CubeIDE GUI and physical RF communication were not tested.
+This fix does not resolve Node 1 E3 V00.
+Complete projects: LoRa-STM32CubeIDE/Projects.
+Ready HEX/BIN: LoRa-STM32CubeIDE/Prebuilt.

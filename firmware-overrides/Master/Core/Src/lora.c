@@ -165,6 +165,22 @@ static uint8_t enterRx(void)
            writeReg(REG_MODE, MODE_RX);
 }
 
+
+static uint8_t enableLnaBoost(void)
+{
+    uint8_t before, requested, actual;
+    if (!readReg(REG_LNA, &before)) return 0U;
+    requested = (uint8_t)(before | 0x03U);
+    if (!writeReg(REG_LNA, requested) ||
+        !readReg(REG_LNA, &actual)) return 0U;
+    if ((actual & 0x03U) == 0x03U) return 1U;
+    loraDiagnostics.lastError = LORA_ERROR_READBACK;
+    loraDiagnostics.failedRegister = REG_LNA;
+    loraDiagnostics.expectedValue = requested;
+    loraDiagnostics.actualValue = actual;
+    return 0U;
+}
+
 uint8_t LoRa_Init(void)
 {
     uint8_t version;
@@ -207,7 +223,7 @@ uint8_t LoRa_Init(void)
         !writeChecked(REG_FRF_LSB, 0x00U) ||
         !writeChecked(REG_TX_BASE, 0x00U) ||
         !writeChecked(REG_RX_BASE, 0x00U) ||
-        !writeChecked(REG_LNA, 0x23U) ||
+        !enableLnaBoost() ||
         !writeChecked(REG_PA_CONFIG, 0x8FU) ||
         !writeChecked(REG_PA_DAC, 0x84U) ||
         !writeChecked(REG_CONFIG1, 0x72U) ||
